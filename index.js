@@ -1,94 +1,66 @@
-var config = require('./config')
-var app = require('express')()
-var fs = require("fs")
-var server = require('https').createServer(
-  {
-    key: fs.readFileSync(config.sslKeyPath).toString(), 
-    cert: fs.readFileSync(config.sslCertPath).toString()
-  }, app)
-var proxy = require('http-proxy').createProxyServer({xfwd: true})
-
-// Allow easy cookie access
-var cookieParser = require('cookie-parser')
-app.use(cookieParser())
+const app = require('express')();
+const config = require('./config');
+const fs = require('fs');
 
 // Morgan for access logging
-var morgan = require('morgan')
-app.use(morgan('combined', { stream: fs.createWriteStream('./access.log', { flags: 'a' }) }))
+var morgan = require('morgan');
+const morganFormat = ':remote-addr [:date[clf]] :method :req[host] :url HTTP/:http-version :status :res[content-length] ":referrer" ":user-agent"';
+app.use(morgan(morganFormat, { stream: fs.createWriteStream('./access.log', { flags: 'a' }) }));
+app.use(morgan(morganFormat));
 
-// Intel for error logging
-var intel = require('intel');
-intel.addHandler(new intel.handlers.File({
-  file: './error.log',
-  formatter: new intel.Formatter({
-    format: "[%(date)s] %(message)s"
-  })
-}));
-intel.handleExceptions(false);
- 
-// Auth
-const { auth } = require('express-openid-connect')
-const authConfig = {
-  authRequired: false,
-  auth0Logout: true,
-  secret: config.auth0Secret,
-  baseURL: config.auth0BaseURL,
-  clientID: config.auth0ClientID,
-  issuerBaseURL: config.auth0IssuerBaseURL,
-  session: {
-    cookie: {
-      domain: config.domain
-    }
+// Parse cookies into request objects
+app.use(require('cookie-parser')());
+
+// Auth0
+app.use(require('./auth')(config));
+
+// Auth checking
+const checkAuth = (req, res, next) => {
+  // If request doesn't require auth
+  if (config.noLogin && config.noLogin(req)) {
+    next();
+  } else if (!req.oidc.isAuthenticated()) {
+    // Redirect to login if not authenticated
+    res.cookie('returnTo', req.headers.host + req.originalUrl, {domain: config.domain});
+    res.redirect('/login');
+  } else if (!config.allowedLogin(req)) {
+    // Return 403 if not allowed to auth
+    res.status(403);
+    res.cookie('appSession', '', {domain: '.'+config.domain, expires: 0});
+    res.send('Access Denied - refresh to login to another account');
+  } else {
+    req.headers["X-Authenticated-User"] = req.oidc.user.email;
+    next();
   }
-}
-app.use(auth(authConfig))
+};
+app.use(checkAuth);
 
-// Proxy http(s) requests
-app.use('/', function(req, res) {
-  try {
-    if (!req.oidc.isAuthenticated()) {
-      res.cookie('returnTo', req.headers.host + req.originalUrl, {domain: config.domain})
-      res.redirect('/login')
-    } else {
-      // Check who's logged in
-      if (!config.allowedLogin.includes(req.oidc.user.email)) {
-        res.status(403)
-        res.send('access denied')
-        return
-      }
-      // If coming from callback, redirect to original page
-      if(req.cookies.returnTo) {
-        res.clearCookie('returnTo', {domain: config.domain})
-        res.redirect('https://' + req.cookies.returnTo)
-        return
-      }
-      req.headers["X-Authenticated-User"] = req.oidc.user.email
-      // Proxy request
-      proxy.web(req, res, {target: 'http://' + config.redirects[req.hostname.replace('.' + config.domain, '')]})
-    }
-  } catch (error) {
-    // Write error to log
-    intel.error(error)
-    // Return 'err'
-    res.status(500)
-    res.send('err')
-    // Print err to console
-    throw error
-  }
-})
+// Redirect to callback set in cookie prior to login
+const checkCallback = (req, res, next) => {
+  if (req.cookies.returnTo) {
+    res.clearCookie('returnTo', {domain: config.domain});
+    res.redirect('https://' + req.cookies.returnTo);
+  } else next();
+};
+app.use(checkCallback);
 
-// Proxy WebSockets requests
-server.on('upgrade', function (req, socket, head) {
-  proxy.ws(req, socket, head, {target: 'ws://' + config.redirects[req.headers.host.split(':')[0].replace('.' + config.domain, '')]})
-})
+// Proxy
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const proxy = createProxyMiddleware({target: config.domain, router: config.router, xfwd: true, logLevel: 'debug', pathRewrite: {}});
+app.use(proxy);
 
-console.log(`Listening at https://${config.domain}:${config.sslPort}`)
-server.listen(config.sslPort)
+// Start
+const server = require('https').createServer({key: fs.readFileSync(config.sslKeyPath).toString(), cert: fs.readFileSync(config.sslCertPath).toString()}, app);
+server.listen(config.sslPort);
+console.log(`Listening at https://${config.domain}:${config.sslPort}`);
+
+// Websockets
+const wsProxy =  createProxyMiddleware({target: config.domain, router: config.router, xfwd: true, ws: true});
+app.use(wsProxy);
+server.on('upgrade', wsProxy.upgrade);
 
 // Upgrade HTTP
-var http = require('express')()
-http.use('*', (req, res) =>{
-  res.redirect('https://' + req.hostname + ":" + config.sslPort + req.url)
-})
-http.listen(config.httpPort)
-console.log(`Listening at http://${config.domain}:${config.httpPort}`)
+var http = require('express')();
+http.use('*', (req, res) => res.redirect(`https://${req.hostname}:${config.sslPort}${req.url}`));
+http.listen(config.httpPort);
+console.log(`Listening at http://${config.domain}:${config.httpPort}`);
